@@ -1,0 +1,674 @@
+diff --git a/src/registry/glm5_next.rs b/src/registry/glm5_next.rs
+new file mode 100644
+index 0000000..1639e09
+--- /dev/null
++++ b/src/registry/glm5_next.rs
+@@ -0,0 +1,182 @@
++use std::collections::HashMap;
++
++use serde_json::{json, Value};
++
++use crate::{
++    encoder_inputs::PreprocessedEncoderInputs,
++    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
++    types::{FieldLayout, Modality, PromptReplacement, TokenId},
++    vision::{processors::Glm5NextProcessor, PreProcessorConfig, VisionPreProcessor},
++};
++
++pub(super) struct Glm5NextVisionSpec;
++
++impl Glm5NextVisionSpec {
++    fn image_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
++        metadata
++            .config_u32(&["image_token_id"])
++            .map(|value| value as TokenId)
++            .ok_or_else(|| ModelRegistryError::MissingConfigField {
++                field: "image_token_id".to_string(),
++            })
++    }
++}
++
++impl ModelProcessorSpec for Glm5NextVisionSpec {
++    fn vision_processor(
++        &self,
++        _metadata: &ModelMetadata,
++        config: &PreProcessorConfig,
++        modality: Modality,
++    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
++        match modality {
++            Modality::Image => Ok(Box::new(Glm5NextProcessor::from_preprocessor_config(config))),
++            _ => Err(ModelRegistryError::UnsupportedModality {
++                spec: self.name(),
++                modality,
++            }),
++        }
++    }
++
++    fn name(&self) -> &'static str {
++        "glm5_next"
++    }
++
++    fn matches(&self, metadata: &ModelMetadata) -> bool {
++        metadata
++            .config_model_type()
++            .is_some_and(|model_type| model_type == "glm5_next")
++            || metadata.model_id.to_ascii_lowercase().contains("glm-5.3")
++    }
++
++    fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
++        Ok("<|image|>".to_string())
++    }
++
++    fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
++        Self::image_token_id(metadata)
++    }
++
++    fn modality_limits(
++        &self,
++        _metadata: &ModelMetadata,
++    ) -> RegistryResult<HashMap<Modality, usize>> {
++        Ok(HashMap::from([(Modality::Image, 64)]))
++    }
++
++    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
++        Ok(json!({}))
++    }
++
++    fn prompt_replacements(
++        &self,
++        metadata: &ModelMetadata,
++        preprocessed: &PreprocessedEncoderInputs,
++    ) -> RegistryResult<Vec<PromptReplacement>> {
++        let image_token_id = Self::image_token_id(metadata)?;
++        let placeholder = self.placeholder_token(metadata)?;
++        // The reference (Python) path wraps every image in
++        // <|begin_of_image|> ... <|end_of_image|>. Fail open to bare image
++        // tokens if a checkpoint omits those ids.
++        let begin = metadata.config_u32(&["image_start_token_id"]).map(|v| v as TokenId);
++        let end = metadata.config_u32(&["image_end_token_id"]).map(|v| v as TokenId);
++        Ok(preprocessed
++            .feature_token_counts
++            .iter()
++            .map(|&num_tokens| {
++                let mut tokens = Vec::with_capacity(num_tokens + 2);
++                if let (Some(begin), Some(_)) = (begin, end) {
++                    tokens.push(begin);
++                }
++                tokens.extend(std::iter::repeat(image_token_id).take(num_tokens));
++                if let (Some(_), Some(end)) = (begin, end) {
++                    tokens.push(end);
++                }
++                PromptReplacement::sequence(Modality::Image, &placeholder, tokens)
++            })
++            .collect())
++    }
++
++    fn field_layouts(&self) -> HashMap<String, FieldLayout> {
++        HashMap::from([
++            (
++                "pixel_values".to_string(),
++                FieldLayout::flat("patches_per_image"),
++            ),
++            ("image_grid_thw".to_string(), FieldLayout::Batched),
++            ("patches_per_image".to_string(), FieldLayout::Batched),
++        ])
++    }
++
++    fn keep_on_cpu_keys(&self) -> Vec<String> {
++        vec!["image_grid_thw".to_string()]
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::json;
++
++    use crate::{
++        registry::{test_helpers::*, ModelMetadata, ModelRegistry},
++        types::{ImageSize, Modality},
++        vision::PreProcessorConfig,
++    };
++
++    #[test]
++    fn glm5_next_matches_model_type_and_expands_image_tokens() {
++        let tokenizer = TestTokenizer::new(&[("<|image|>", 154854)]);
++        let config = json!({
++            "model_type": "glm5_next",
++            "image_token_id": 154854,
++            "image_start_token_id": 154830,
++            "image_end_token_id": 154831
++        });
++        let metadata = ModelMetadata {
++            model_id: "custom-glm",
++            tokenizer: &tokenizer,
++            config: &config,
++        };
++        let registry = ModelRegistry::new();
++        let spec = registry.lookup(&metadata).expect("glm5_next spec");
++        assert_eq!(spec.name(), "glm5_next");
++        let replacements = spec
++            .prompt_replacements(
++                &metadata,
++                &test_preprocessed_with_tokens(&[ImageSize::new(448, 448)], &[256]),
++            )
++            .unwrap();
++        let tokens = &replacements[0].tokens;
++        assert_eq!(tokens.len(), 258);
++        assert_eq!(tokens[0], 154830);
++        assert_eq!(tokens[257], 154831);
++        assert!(tokens[1..257].iter().all(|&token| token == 154854));
++    }
++
++    #[test]
++    fn glm5_next_resolves_for_the_real_checkpoint_and_builds_an_image_processor() {
++        // Regression for the DI error "unsupported multimodal content: image_url":
++        // without a registered spec that also builds a vision processor, the Rust
++        // frontend has no image token and rejects every image_url.
++        let tokenizer = TestTokenizer::new(&[("<|image|>", 154854)]);
++        let config = json!({
++            "model_type": "glm5_next",
++            "image_token_id": 154854,
++            "video_token_id": 154855
++        });
++        let metadata = ModelMetadata {
++            model_id: "nvidia/GLM-5.3-Flash-NVFP4",
++            tokenizer: &tokenizer,
++            config: &config,
++        };
++        let registry = ModelRegistry::new();
++        let spec = registry.lookup(&metadata).expect("glm5_next spec");
++        assert_eq!(spec.name(), "glm5_next");
++        assert!(spec
++            .vision_processor(&metadata, &PreProcessorConfig::default(), Modality::Image)
++            .is_ok());
++        assert!(spec
++            .vision_processor(&metadata, &PreProcessorConfig::default(), Modality::Video)
++            .is_err());
++    }
++}
+diff --git a/src/registry/mod.rs b/src/registry/mod.rs
+index 84784ff..a24e2a7 100644
+--- a/src/registry/mod.rs
++++ b/src/registry/mod.rs
+@@ -1,4 +1,5 @@
+ mod deepseek_v41;
++mod glm5_next;
+ mod inkling;
+ mod kimi_k25;
+ mod kimi_k3;
+@@ -14,6 +15,7 @@ mod qwen_vl;
+ mod traits;
+ 
+ use deepseek_v41::DeepseekV41VisionSpec;
++use glm5_next::Glm5NextVisionSpec;
+ use inkling::InklingSpec;
+ use kimi_k25::KimiK25VisionSpec;
+ use kimi_k3::KimiK3VisionSpec;
+@@ -42,6 +44,7 @@ impl ModelRegistry {
+         Self {
+             specs: vec![
+                 LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
++                LazySpec::new(|| Box::new(Glm5NextVisionSpec)),
+                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
+                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
+                 LazySpec::new(|| Box::new(Llama4Spec)),
+diff --git a/src/vision/processors/glm5_next.rs b/src/vision/processors/glm5_next.rs
+new file mode 100644
+index 0000000..a3f7abd
+--- /dev/null
++++ b/src/vision/processors/glm5_next.rs
+@@ -0,0 +1,227 @@
++//! GLM-5.3-Flash image processor.
++
++use std::ops::Deref;
++
++use image::DynamicImage;
++
++use super::qwen_vl_base::{
++    QwenImageResizeMode, QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode,
++};
++use crate::vision::{
++    preprocessor_config::PreProcessorConfig,
++    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
++    transforms::TransformError,
++};
++
++pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
++pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
++pub const DEFAULT_PATCH_SIZE: usize = 14;
++pub const DEFAULT_MERGE_SIZE: usize = 2;
++pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
++pub const DEFAULT_MIN_IMAGE_TOKENS: usize = 16;
++pub const DEFAULT_MAX_IMAGE_TOKENS: usize = 8000;
++
++fn pixel_budget(
++    min_image_tokens: usize,
++    max_image_tokens: usize,
++    patch_size: usize,
++    merge_size: usize,
++    temporal_patch_size: usize,
++) -> (usize, usize) {
++    let factor = temporal_patch_size * (patch_size * merge_size).pow(2);
++    (min_image_tokens * factor, max_image_tokens * factor)
++}
++
++#[derive(Debug, Clone)]
++pub struct Glm5NextProcessor {
++    inner: QwenVLProcessorBase,
++}
++
++impl Default for Glm5NextProcessor {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++impl Glm5NextProcessor {
++    pub fn new() -> Self {
++        Self::with_config(
++            DEFAULT_PATCH_SIZE,
++            DEFAULT_MERGE_SIZE,
++            DEFAULT_TEMPORAL_PATCH_SIZE,
++            DEFAULT_MIN_IMAGE_TOKENS,
++            DEFAULT_MAX_IMAGE_TOKENS,
++        )
++    }
++
++    pub fn with_config(
++        patch_size: usize,
++        merge_size: usize,
++        temporal_patch_size: usize,
++        min_image_tokens: usize,
++        max_image_tokens: usize,
++    ) -> Self {
++        Self::build(
++            patch_size,
++            merge_size,
++            temporal_patch_size,
++            min_image_tokens,
++            max_image_tokens,
++            &PreProcessorConfig::default(),
++        )
++    }
++
++    fn build(
++        patch_size: usize,
++        merge_size: usize,
++        temporal_patch_size: usize,
++        min_image_tokens: usize,
++        max_image_tokens: usize,
++        transform: &PreProcessorConfig,
++    ) -> Self {
++        let (min_pixels, max_pixels) = pixel_budget(
++            min_image_tokens,
++            max_image_tokens,
++            patch_size,
++            merge_size,
++            temporal_patch_size,
++        );
++        Self {
++            inner: QwenVLProcessorBase::new(QwenVLConfig {
++                patch_size,
++                merge_size,
++                min_pixels,
++                max_pixels,
++                video_min_pixels: min_pixels,
++                video_max_pixels: max_pixels,
++                video_resize_mode: QwenVideoResizeMode::TotalVolume,
++                temporal_patch_size,
++                mean: CLIP_MEAN,
++                std: CLIP_STD,
++                model_name: "glm5_next",
++            })
++            // Resolve the checkpoint's resampling / normalization once, then pin the
++            // GLM pad-resize behavior (kept across with_preprocessor_config).
++            .with_preprocessor_config(transform)
++            .with_image_resize_mode(QwenImageResizeMode::GlmPad),
++        }
++    }
++
++    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
++        let patch_size = config.get_patch_size(DEFAULT_PATCH_SIZE);
++        let merge_size = config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE);
++        let temporal_patch_size = config
++            .temporal_patch_size
++            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE);
++        let min_image_tokens = config
++            .get_extra::<usize>("min_image_tokens")
++            .unwrap_or(DEFAULT_MIN_IMAGE_TOKENS);
++        let max_image_tokens = config
++            .get_extra::<usize>("max_image_tokens")
++            .unwrap_or(DEFAULT_MAX_IMAGE_TOKENS);
++        Self::build(
++            patch_size,
++            merge_size,
++            temporal_patch_size,
++            min_image_tokens,
++            max_image_tokens,
++            config,
++        )
++    }
++
++    pub fn patch_size(&self) -> usize {
++        self.inner.patch_size()
++    }
++
++    pub fn merge_size(&self) -> usize {
++        self.inner.merge_size()
++    }
++
++    pub fn temporal_patch_size(&self) -> usize {
++        self.inner.temporal_patch_size()
++    }
++
++    pub fn min_pixels(&self) -> usize {
++        self.inner.min_pixels()
++    }
++
++    pub fn max_pixels(&self) -> usize {
++        self.inner.max_pixels()
++    }
++}
++
++impl Deref for Glm5NextProcessor {
++    type Target = QwenVLProcessorBase;
++
++    fn deref(&self) -> &Self::Target {
++        &self.inner
++    }
++}
++
++impl VisionPreProcessor for Glm5NextProcessor {
++    fn default_mean(&self) -> [f64; 3] {
++        self.inner.default_mean()
++    }
++
++    fn default_std(&self) -> [f64; 3] {
++        self.inner.default_std()
++    }
++
++    fn preprocess(
++        &self,
++        images: &[DynamicImage],
++    ) -> Result<PreprocessedEncoderInputs, TransformError> {
++        self.inner.preprocess(images)
++    }
++
++    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
++        self.inner.calculate_num_tokens(width, height)
++    }
++
++    fn model_name(&self) -> &'static str {
++        self.inner.model_name()
++    }
++
++    fn get_processed_size(&self) -> Option<(u32, u32)> {
++        self.inner.get_processed_size()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use image::{DynamicImage, RgbImage};
++
++    use super::*;
++    use crate::vision::processor::ModelSpecificValue;
++
++    #[test]
++    fn glm_defaults_match_checkpoint() {
++        let processor = Glm5NextProcessor::new();
++        assert_eq!(processor.patch_size(), 14);
++        assert_eq!(processor.merge_size(), 2);
++        assert_eq!(processor.temporal_patch_size(), 2);
++        assert_eq!(processor.min_pixels(), 16 * 2 * 28 * 28);
++        assert_eq!(processor.max_pixels(), 8000 * 2 * 28 * 28);
++    }
++
++    #[test]
++    fn glm_448_image_has_256_tokens() {
++        let processor = Glm5NextProcessor::new();
++        assert_eq!(processor.calculate_num_tokens(448, 448), 256);
++    }
++
++    #[test]
++    fn glm_preprocess_emits_grid_and_patch_counts() {
++        let processor = Glm5NextProcessor::new();
++        let image = DynamicImage::ImageRgb8(RgbImage::new(448, 448));
++        let out = processor.preprocess(&[image]).unwrap();
++        assert_eq!(out.feature_token_counts, vec![256]);
++        match out.model_specific.get("image_grid_thw") {
++            Some(ModelSpecificValue::IntTensor { data, shape }) => {
++                assert_eq!(shape, &vec![1, 3]);
++                assert_eq!(data, &vec![1, 32, 32]);
++            }
++            other => panic!("unexpected image_grid_thw: {other:?}"),
++        }
++    }
++}
+diff --git a/src/vision/processors/mod.rs b/src/vision/processors/mod.rs
+index 9842e58..5165000 100644
+--- a/src/vision/processors/mod.rs
++++ b/src/vision/processors/mod.rs
+@@ -21,6 +21,7 @@
+ //! - **Nemotron-H Omni** (`nemotron_h_omni`): Dynamic-resolution RADIO preprocessing with pixel-shuffle token budgeting
+ 
+ pub mod deepseek_v41;
++pub mod glm5_next;
+ pub mod inkling;
+ pub(crate) mod kimi_base;
+ pub mod kimi_k25;
+@@ -38,6 +39,7 @@ pub mod qwen3_vl;
+ pub mod qwen_vl_base;
+ 
+ pub use deepseek_v41::DeepseekV41Processor;
++pub use glm5_next::Glm5NextProcessor;
+ pub use inkling::InklingImageProcessor;
+ pub use kimi_k25::KimiK25Processor;
+ pub use kimi_k3::KimiK3Processor;
+diff --git a/src/vision/processors/qwen_vl_base.rs b/src/vision/processors/qwen_vl_base.rs
+index ee55dde..b3b70ff 100644
+--- a/src/vision/processors/qwen_vl_base.rs
++++ b/src/vision/processors/qwen_vl_base.rs
+@@ -23,7 +23,7 @@
+ 
+ use std::borrow::Cow;
+ 
+-use image::{imageops::FilterType, DynamicImage, GenericImageView};
++use image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
+ use ndarray::{Array2, Array3};
+ 
+ use crate::{
+@@ -90,6 +90,12 @@ pub enum QwenVideoResizeMode {
+     PerFrame,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum QwenImageResizeMode {
++    QwenResize,
++    GlmPad,
++}
++
+ #[derive(Clone)]
+ struct VideoFrameRgb<'a> {
+     width: usize,
+@@ -322,6 +328,7 @@ pub struct QwenVLProcessorBase {
+     do_resize: bool,
+     lut: [[f32; 256]; 3],
+     sample_fps: f32,
++    image_resize_mode: QwenImageResizeMode,
+ }
+ 
+ impl QwenVLProcessorBase {
+@@ -336,13 +343,23 @@ impl QwenVLProcessorBase {
+             do_resize: preprocessor.do_resize.unwrap_or(true),
+             lut: normalization_lut(preprocessor, config.mean, config.std),
+             sample_fps: preprocessor.get_extra::<f32>("fps").unwrap_or(2.0),
++            image_resize_mode: QwenImageResizeMode::QwenResize,
+             config,
+         }
+     }
+ 
+     /// Resolve transform parameters while retaining this processor's geometry.
+     pub fn with_preprocessor_config(self, config: &PreProcessorConfig) -> Self {
+-        Self::from_configs(self.config, config)
++        let image_resize_mode = self.image_resize_mode;
++        let mut rebuilt = Self::from_configs(self.config, config);
++        rebuilt.image_resize_mode = image_resize_mode;
++        rebuilt
++    }
++
++    /// Override image resize/canvas behavior for model-specific processors.
++    pub fn with_image_resize_mode(mut self, mode: QwenImageResizeMode) -> Self {
++        self.image_resize_mode = mode;
++        self
+     }
+ 
+     /// Get the patch size.
+@@ -509,6 +526,10 @@ impl QwenVLProcessorBase {
+         height: usize,
+         width: usize,
+     ) -> Result<(usize, usize), TransformError> {
++        if self.image_resize_mode == QwenImageResizeMode::GlmPad {
++            return self.smart_resize_glm(height, width);
++        }
++
+         let factor = self.get_factor();
+ 
+         // Validate non-zero dimensions
+@@ -559,6 +580,123 @@ impl QwenVLProcessorBase {
+         Ok((h_bar, w_bar))
+     }
+ 
++    fn smart_resize_glm(
++        &self,
++        height: usize,
++        width: usize,
++    ) -> Result<(usize, usize), TransformError> {
++        let factor = self.get_factor();
++        let temporal = self.config.temporal_patch_size;
++        if height == 0 || width == 0 || factor == 0 || temporal == 0 {
++            return Err(TransformError::InvalidShape {
++                expected: "positive image dimensions and alignment factors".to_string(),
++                actual: vec![height, width, factor, temporal],
++            });
++        }
++        if self.config.min_pixels == 0
++            || self.config.max_pixels == 0
++            || self.config.min_pixels > self.config.max_pixels
++        {
++            return Err(TransformError::ShapeError(format!(
++                "invalid GLM pixel budget: min={} max={}",
++                self.config.min_pixels, self.config.max_pixels
++            )));
++        }
++
++        let ceil_factor = |value: usize| value.div_ceil(factor) * factor;
++        let mut h_bar = ceil_factor(height);
++        let mut w_bar = ceil_factor(width);
++
++        let volume = |h: usize, w: usize| temporal.checked_mul(h).and_then(|v| v.checked_mul(w));
++
++        let fit_within_budget =
++            |source_h: usize, source_w: usize| -> Result<(usize, usize), TransformError> {
++                let minimum = temporal * factor * factor;
++                if self.config.max_pixels < minimum {
++                    return Err(TransformError::ShapeError(format!(
++                        "GLM max_pixels={} is smaller than one aligned patch volume {}",
++                        self.config.max_pixels, minimum
++                    )));
++                }
++                let mut low = 1usize;
++                let mut high = source_h;
++                let mut best_h = factor;
++                let mut best_w = factor;
++                while low <= high {
++                    let content_h = low + (high - low) / 2;
++                    let content_w =
++                        ((source_w as u128 * content_h as u128) / source_h as u128).max(1) as usize;
++                    let aligned_h = ceil_factor(content_h);
++                    let aligned_w = ceil_factor(content_w);
++                    if volume(aligned_h, aligned_w).is_some_and(|v| v <= self.config.max_pixels) {
++                        best_h = aligned_h;
++                        best_w = aligned_w;
++                        low = content_h.saturating_add(1);
++                    } else if content_h == 0 {
++                        break;
++                    } else {
++                        high = content_h - 1;
++                    }
++                }
++                Ok((best_h, best_w))
++            };
++
++        let current = volume(h_bar, w_bar).ok_or_else(|| {
++            TransformError::ShapeError("GLM image canvas volume overflow".to_string())
++        })?;
++        if current > self.config.max_pixels {
++            (h_bar, w_bar) = fit_within_budget(height, width)?;
++        } else if current < self.config.min_pixels {
++            let beta = (self.config.min_pixels as f64
++                / (temporal as f64 * height as f64 * width as f64))
++                .sqrt();
++            h_bar = ceil_factor(((height as f64 * beta).ceil() as usize).max(1));
++            w_bar = ceil_factor(((width as f64 * beta).ceil() as usize).max(1));
++            if volume(h_bar, w_bar).is_some_and(|v| v > self.config.max_pixels) {
++                (h_bar, w_bar) = fit_within_budget(height, width)?;
++            }
++        }
++
++        Ok((h_bar, w_bar))
++    }
++
++    fn glm_resize_or_pad(
++        &self,
++        image: &DynamicImage,
++        target_width: u32,
++        target_height: u32,
++        filter: FilterType,
++    ) -> DynamicImage {
++        let (width, height) = image.dimensions();
++        let allow_upscale =
++            self.config.temporal_patch_size as u128 * height as u128 * (width as u128)
++                < self.config.min_pixels as u128;
++        let mut scale =
++            (target_height as f64 / height as f64).min(target_width as f64 / width as f64);
++        if !allow_upscale {
++            scale = scale.min(1.0);
++        }
++        let content_height = ((height as f64 * scale).floor() as u32)
++            .max(1)
++            .min(target_height);
++        let content_width = ((width as f64 * scale).floor() as u32)
++            .max(1)
++            .min(target_width);
++
++        let content = if content_width != width || content_height != height {
++            if filter == FilterType::CatmullRom {
++                resize_bicubic_pil(image, content_width, content_height).to_rgb8()
++            } else {
++                resize(image, content_width, content_height, filter).to_rgb8()
++            }
++        } else {
++            image.to_rgb8()
++        };
++        let mut canvas = RgbImage::new(target_width, target_height);
++        image::imageops::replace(&mut canvas, &content, 0, 0);
++        DynamicImage::ImageRgb8(canvas)
++    }
++
+     /// Smart resize for Qwen3-style video processors.
+     ///
+     /// `TotalVolume` applies the pixel budget to the padded sampled video
+@@ -1167,7 +1305,11 @@ impl VisionPreProcessor for QwenVLProcessorBase {
+         for (image, plan) in images.iter().zip(image_plans) {
+             // Resize to the image's own target size (skip if dimensions match)
+             let resized;
+-            let img_ref = if plan.needs_resize {
++            let img_ref = if self.image_resize_mode == QwenImageResizeMode::GlmPad {
++                resized =
++                    self.glm_resize_or_pad(image, plan.target_width, plan.target_height, filter);
++                &resized
++            } else if plan.needs_resize {
+                 // BICUBIC (Qwen default) uses the PIL-compatible path; other
+                 // filters keep the SIMD path.
+                 resized = if filter == FilterType::CatmullRom {

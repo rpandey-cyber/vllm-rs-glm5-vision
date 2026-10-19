@@ -11,8 +11,10 @@ Stock `vllm-rs` has no `glm5_next` entry in `llm-multimodal`'s model registry, s
 
 | File | What it is |
 |------|-----------|
-| `vllm-rs` | Linux x86_64 binary, built from vLLM `385dce36b` (0.28.1rc1.dev580) with the patch applied. Built with vLLM's own flags (`--bin vllm-rs --features native-tls-vendored`). |
-| `llm-multimodal-glm5_next.patch` | The change, as a diff against `smg-project/llm-multimodal` at `74f64753e040ade87c9d7f4bb0ad2f4dd7764652` (the revision that vLLM commit pins). |
+| `vllm-rs` (release v0.1.0) | Linux x86_64 binary for vLLM `385dce36b` (0.28.1rc1.dev580, the `glm53-flash` image). |
+| `llm-multimodal-glm5_next.patch` | Its patch, against `smg-project/llm-multimodal` at `74f64753e040ade87c9d7f4bb0ad2f4dd7764652`. |
+| `vllm-rs-0.32.0` (release v0.2.0) | Linux x86_64 binary for vLLM **v0.32.0** (`vllm/vllm-openai:v0.32.0`). sha256 `a240f0a28d4b0b852d11041811f3f3b9550b98fb21de36d2099b80fa520f86ae`. |
+| `llm-multimodal-glm5_next-vllm-0.32.0.patch` | Its patch, against `llm-multimodal` at `f0985ef65967615db2c79279aa07818499301bfd` (the revision vLLM v0.32.0 pins). |
 
 The patch is based on [llm-multimodal PR #14](https://github.com/smg-project/llm-multimodal/pull/14)
 (by thuanpham582002), re-anchored to the pinned revision, with a compile fix, and with
@@ -31,7 +33,7 @@ export VLLM_USE_RUST_FRONTEND=1
 export VLLM_RUST_FRONTEND_PATH=/tmp/vllm-rs
 ```
 
-Only valid for the vLLM build above. For other vLLM versions, rebuild with the patch.
+Each binary is only valid for the vLLM build listed above. For other vLLM versions, rebuild with the patch.
 
 ## Rebuild
 
